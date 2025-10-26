@@ -79,80 +79,99 @@ os.makedirs(CACHE_DIR, exist_ok=True)
 
 # --------------------------------------------------
 # ---------- 1. fetch_one 返回前 ----------
+# -------------- 1. fetch_one 改成“日期驱动回补” --------------
 def fetch_one(code: str, days: int):
     cache = os.path.join(CACHE_DIR, f"{code}.pkl")
+    hit_cache = False
+    df = None
+
+    # 读缓存
     if os.path.exists(cache):
         try:
             df = pd.read_pickle(cache)
-            if len(df) >= days + 60:
-                return df.iloc[-days:]
         except Exception:
-            pass
+            df = None
 
-    end = datetime.today().strftime("%Y-%m-%d")
-    df = None
+    # 要不要补新数据
+    last_cached = df.index[-1] if df is not None and len(df) else None
+    need_update = (last_cached is None or
+                   last_cached.date() < pd.Timestamp("today").date())
+
+    # 缓存够长且无需更新 → 直接返回
+    if df is not None and len(df) >= days + 60 and not need_update:
+        hit_cache = True
+        return df.iloc[-days:], hit_cache
+
+    # 需要补的数据区间
+    start_date_needed = (last_cached + pd.Timedelta(days=1)).strftime(r"%Y-%m-%d") \
+                        if last_cached else START_DATE
+    end = pd.Timestamp("today").strftime(r"%Y-%m-%d")
+    new_df = None
 
     # 1. 东财
     try:
         time.sleep(np.random.uniform(0.8, 1.5))
-        df = ak.stock_hk_hist(symbol=code, period="daily",
-                              start_date=START_DATE, end_date=end, adjust="qfq")
-        if df is not None and not df.empty:
-            print(f"[东财] {code} 成功")
+        new_df = ak.stock_hk_hist(symbol=code, period="daily",
+                                  start_date=start_date_needed,
+                                  end_date=end, adjust="qfq")
+        if new_df is not None and not new_df.empty:
+            print(f"[东财] {code} 新数据 {len(new_df)} 根")
     except Exception as e:
         print(f"[东财] {code} 失败：{str(e)[:60]}")
 
-    # 2. 新浪
-    if df is None or df.empty:
+    # 2. 新浪降级
+    if (new_df is None or new_df.empty) and need_update:
         try:
             time.sleep(np.random.uniform(0.8, 1.5))
-            df = ak.stock_hk_daily(symbol=code, adjust="qfq")
-            if df is not None and not df.empty:
-                df["date"] = pd.to_datetime(df["date"])
-                df = df[df["date"] >= START_DATE]
-                print(f"[新浪] {code} 成功")
+            new_df = ak.stock_hk_daily(symbol=code, adjust="qfq")
+            if new_df is not None and not new_df.empty:
+                new_df["date"] = pd.to_datetime(new_df["date"])
+                new_df = new_df[new_df["date"] >= start_date_needed]
+                print(f"[新浪] {code} 新数据 {len(new_df)} 根")
         except Exception as e:
             print(f"[新浪] {code} 失败：{str(e)[:60]}")
 
-    # 彻底没拉到数据
-    if df is None or df.empty or len(df) < 60:
-        print(f"↓↓ 彻底 skip {code}")
-        return None
+    # 合并/整理
+    if new_df is not None and not new_df.empty:
+        if "日期" in new_df.columns:
+            new_df = new_df.rename(columns={"日期": "date", "收盘": "close"})
+        elif "date" not in new_df.columns:
+            new_df = new_df.reset_index().rename(columns={"index": "date"})
+        if "close" not in new_df.columns:
+            new_df = new_df.rename(columns={"收盘": "close"})
 
-    # 统一列名 → 只保留这两列 → 日期当索引
-    if "日期" in df.columns:
-        df = df.rename(columns={"日期": "date", "收盘": "close"})
-    elif "date" not in df.columns:
-        df = df.reset_index().rename(columns={"index": "date"})
-    if "close" not in df.columns:
-        df = df.rename(columns={"收盘": "close"})
+        new_df = new_df[["date", "close"]].copy()
+        new_df["date"] = pd.to_datetime(new_df["date"])
+        new_df = new_df.set_index("date").sort_index()
 
-    df = df[["date", "close"]].copy()
-    df["date"] = pd.to_datetime(df["date"])
-    df = df.set_index("date").sort_index()
+        df = new_df if df is None else pd.concat([df, new_new]).loc[~pd.concat([df, new_df]).index.duplicated()]
+
+    if df is None or len(df) < 60:
+        return None, False
+
     df["ma60"] = df["close"].rolling(60).mean()
     df["above"] = df["close"] > df["ma60"]
     df.to_pickle(cache)
-    return df.iloc[-days:]
-# --------------------------------------------------
+    return df.iloc[-days:], hit_cache
+# ------------------ 2. load_all 解包返回值 ------------------
 def load_all(stocks: dict, days: int):
     codes = list(stocks.values())
     with concurrent.futures.ThreadPoolExecutor(MAX_THREADS) as pool:
         fut2code = {pool.submit(fetch_one, c, days): c for c in codes}
         data = {}
         for f in concurrent.futures.as_completed(fut2code):
-            c, df = fut2code[f], f.result()
+            c, (df, hit) = fut2code[f], f.result()      # ⬅️ 解包 hit
             if df is not None:
                 data[c] = df
+                print(f"{c}  {'[缓存]' if hit else '[新获取]'}")
         print(f"本次有效股票 {len(data)}/{len(codes)}")
         return data
-
 # --------------------------------------------------
 # 计算比例 & 等权指数
 # --------------------------------------------------
 # ---------- 2. calc_ratio_and_eqindex 里 ----------
 def calc_ratio_and_eqindex(stock_data: dict):
-    # 所有真实日期
+    # ⬅️ 这里千万别写成 df.index()
     all_dates = sorted({d for df in stock_data.values() for d in df.index})
     print('最早日期:', all_dates[0], '  最晚日期:', all_dates[-1])
     ratio, eq_idx = [], []
